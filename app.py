@@ -178,7 +178,6 @@ def register_user(user:UserRegister):
 
     connection.commit()
 
-    # Welcome Notification
     user_id = cursor.lastrowid
     add_notification(user_id, f"Welcome {user.name}! Your account has been created successfully.")
 
@@ -286,28 +285,32 @@ async def encrypt_file(email:str=Form(...),file:UploadFile=File(...)):
     with open(path,"w") as f:
         json.dump(package,f)
 
+    # -------- ADDED LINES --------
+    file_format = file.filename.split(".")[-1]
+    decryption_key = base64.b64encode(aes_key).decode()
+    # -----------------------------
+
     connection=get_connection()
     cursor=connection.cursor(dictionary=True)
 
     cursor.execute("SELECT id FROM users WHERE email=%s",(email,))
     user=cursor.fetchone()
 
+    # -------- UPDATED INSERT --------
     cursor.execute("""
-        INSERT INTO files(user_id,file_name,file_path,file_type)
-        VALUES(%s,%s,%s,%s)
-    """,(user["id"],filename,path,"encrypted"))
+        INSERT INTO files(user_id,file_name,file_format,file_path,file_type,decryption_key)
+        VALUES(%s,%s,%s,%s,%s,%s)
+    """,(user["id"],filename,file_format,path,"encrypted",decryption_key))
+    # --------------------------------
 
     connection.commit()
 
     file_id = cursor.lastrowid
 
-    # Encryption Notification
     add_notification(user["id"], f"File encrypted successfully: {file.filename}")
 
     cursor.close()
     connection.close()
-
-    decryption_key=base64.b64encode(aes_key).decode()
 
     return {
         "message":"Encryption successful",
