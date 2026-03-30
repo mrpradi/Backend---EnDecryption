@@ -24,7 +24,7 @@ app = FastAPI()
 # ==========================================================
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000","http://127.0.0.1:3000"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -156,6 +156,23 @@ class ChangePassword(BaseModel):
     new_password:str
     confirm_password:str
 
+class ForgotPassword(BaseModel):
+    email:EmailStr
+
+class ResetPassword(BaseModel):
+    email:EmailStr
+    new_password:str
+    confirm_password:str
+
+    @validator("new_password")
+    def validate_password(cls,value):
+        if len(value)<8: raise ValueError("Password must be 8 characters")
+        if not re.search(r"[A-Z]",value): raise ValueError("Need uppercase")
+        if not re.search(r"[a-z]",value): raise ValueError("Need lowercase")
+        if not re.search(r"[0-9]",value): raise ValueError("Need number")
+        if not re.search(r"[!@#$%^&*]",value): raise ValueError("Need special symbol")
+        return value
+
 # ==========================================================
 # REGISTER
 # ==========================================================
@@ -241,6 +258,130 @@ def login_user(user:UserLogin):
     return {"message":"Login successful","user_id":db_user["id"]}
 
 # ==========================================================
+# GET PROFILE
+# ==========================================================
+@app.get("/profile/{email}")
+def get_user_profile(email:str):
+    connection=get_connection()
+    cursor=connection.cursor(dictionary=True)
+
+    cursor.execute("SELECT name, email, age FROM users WHERE email=%s", (email,))
+    user = cursor.fetchone()
+
+    cursor.close()
+    connection.close()
+
+    if not user:
+        raise HTTPException(404, "User not found")
+
+    return user
+
+# ==========================================================
+# UPDATE PROFILE
+# ==========================================================
+@app.post("/update-profile")
+def update_profile(data:UpdateProfile):
+
+    connection=get_connection()
+    cursor=connection.cursor(dictionary=True)
+
+    cursor.execute("SELECT id FROM users WHERE email=%s",(data.email,))
+    user=cursor.fetchone()
+
+    if not user:
+        cursor.close()
+        connection.close()
+        raise HTTPException(404,"User not found")
+
+    cursor.execute("UPDATE users SET name=%s, age=%s WHERE email=%s",(data.name,data.age,data.email))
+    connection.commit()
+
+    add_notification(user["id"], "Your profile information has been updated successfully.")
+
+    cursor.close()
+    connection.close()
+
+    return {"message":"Profile updated successfully"}
+
+# ==========================================================
+# WIPE ALL DATA
+# ==========================================================
+@app.delete("/wipe-data/{email}")
+def wipe_user_data(email:str):
+    connection = get_connection()
+    cursor = connection.cursor(dictionary=True)
+
+    # 1. Get user ID
+    cursor.execute("SELECT id FROM users WHERE email=%s", (email,))
+    user = cursor.fetchone()
+
+    if not user:
+        cursor.close()
+        connection.close()
+        raise HTTPException(404, "User not found")
+
+    user_id = user["id"]
+
+    # 2. Get all file paths and delete actual files from filesystem
+    cursor.execute("SELECT file_path FROM files WHERE user_id=%s", (user_id,))
+    user_files = cursor.fetchall()
+
+    for f in user_files:
+        path = f["file_path"]
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except Exception as e:
+                print(f"Error deleting file {path}: {e}")
+
+    # 3. Delete database records
+    cursor.execute("DELETE FROM files WHERE user_id=%s", (user_id,))
+    cursor.execute("DELETE FROM notifications WHERE user_id=%s", (user_id,))
+
+    connection.commit()
+    cursor.close()
+    connection.close()
+
+    return {"message": "All user data wiped successfully"}
+
+# ==========================================================
+# CHANGE PASSWORD
+# ==========================================================
+@app.post("/change-password")
+def change_password(data:ChangePassword):
+
+    connection=get_connection()
+    cursor=connection.cursor(dictionary=True)
+
+    cursor.execute("SELECT id, password FROM users WHERE email=%s",(data.email,))
+    user=cursor.fetchone()
+
+    if not user:
+        cursor.close()
+        connection.close()
+        raise HTTPException(404,"User not found")
+
+    if user["password"]!=data.current_password:
+        cursor.close()
+        connection.close()
+        raise HTTPException(400,"Incorrect current password")
+
+    if data.new_password != data.confirm_password:
+        cursor.close()
+        connection.close()
+        raise HTTPException(400,"Passwords do not match")
+
+    cursor.execute("UPDATE users SET password=%s WHERE email=%s",(data.new_password,data.email))
+    connection.commit()
+
+    add_notification(user["id"], "Your account password has been updated successfully.")
+
+    cursor.close()
+    connection.close()
+
+    return {"message":"Password changed successfully"}
+
+# ==========================================================
 # HYBRID ENCRYPTION
 # ==========================================================
 @app.post("/encrypt-file")
@@ -272,6 +413,7 @@ async def encrypt_file(email:str=Form(...),file:UploadFile=File(...)):
     )
 
     package={
+        "filename": file.filename,
         "key":base64.b64encode(encrypted_key).decode(),
         "nonce":base64.b64encode(nonce).decode(),
         "ciphertext":base64.b64encode(ciphertext).decode(),
@@ -365,63 +507,83 @@ def download_encrypted_file(file_id:int):
 # ==========================================================
 # HYBRID DECRYPTION
 # ==========================================================
+import mimetypes
+
 @app.post("/decrypt-file")
-async def decrypt_file(file:UploadFile=File(...),decryption_key:str=Form(...)):
+async def decrypt_file(file:UploadFile=File(...),decryption_key:str=Form(...), email:str=Form(None)):
 
-    encrypted_content=await file.read()
-    package=json.loads(encrypted_content)
+    try:
+        encrypted_content=await file.read()
+        package=json.loads(encrypted_content)
 
-    encrypted_key=base64.b64decode(package["key"])
-    nonce=base64.b64decode(package["nonce"])
-    ciphertext=base64.b64decode(package["ciphertext"])
-    mac=base64.b64decode(package["hmac"])
-    original_hash=base64.b64decode(package["hash"])
+        original_filename = package.get("filename", "decrypted_file")
+        encrypted_key=base64.b64decode(package["key"])
+        nonce=base64.b64decode(package["nonce"])
+        ciphertext=base64.b64decode(package["ciphertext"])
+        mac=base64.b64decode(package["hmac"])
+        original_hash=base64.b64decode(package["hash"])
 
-    aes_key=private_key.decrypt(
-        encrypted_key,
-        padding.OAEP(
-            mgf=padding.MGF1(hashes.SHA256()),
-            algorithm=hashes.SHA256(),
-            label=None
+        # Try to use the user-provided key directly first for AES decryption
+        try:
+            aes_key = base64.b64decode(decryption_key.strip())
+        except Exception:
+             raise HTTPException(400,"Invalid Decryption Key Format")
+
+        # Verify integrity before decryption
+        h=hmac.HMAC(aes_key,hashes.SHA256())
+        h.update(ciphertext)
+        try:
+            h.verify(mac)
+        except Exception:
+            raise HTTPException(400,"Invalid Decryption Key or Tampered File")
+
+        aes=AESGCM(aes_key)
+        decrypted=aes.decrypt(nonce,ciphertext,None)
+
+        digest=hashes.Hash(hashes.SHA3_256())
+        digest.update(decrypted)
+        new_hash=digest.finalize()
+
+        if new_hash!=original_hash:
+            raise HTTPException(400,"Tamper detected")
+
+        # Generate a unique unique temp file path
+        unique_id = secrets.token_hex(8)
+        temp_filename = f"temp_{unique_id}_{original_filename}"
+        path=os.path.join(BASE_UPLOAD_FOLDER, temp_filename)
+
+        with open(path,"wb") as f:
+            f.write(decrypted)
+
+        # Decryption Notification
+        if email:
+            connection=get_connection()
+            cursor=connection.cursor(dictionary=True)
+
+            cursor.execute("SELECT id FROM users WHERE email=%s",(email,))
+            user=cursor.fetchone()
+
+            if user:
+                add_notification(user["id"], f"File decrypted successfully: {original_filename}")
+
+            cursor.close()
+            connection.close()
+
+        # Get MIME type for better browser handling
+        mime_type, _ = mimetypes.guess_type(original_filename)
+        if not mime_type:
+            mime_type = "application/octet-stream"
+
+        return FileResponse(
+            path, 
+            filename=original_filename, 
+            media_type=mime_type
         )
-    )
-
-    if base64.b64encode(aes_key).decode()!=decryption_key:
-        raise HTTPException(400,"Invalid Decryption Key")
-
-    h=hmac.HMAC(aes_key,hashes.SHA256())
-    h.update(ciphertext)
-    h.verify(mac)
-
-    aes=AESGCM(aes_key)
-    decrypted=aes.decrypt(nonce,ciphertext,None)
-
-    digest=hashes.Hash(hashes.SHA3_256())
-    digest.update(decrypted)
-    new_hash=digest.finalize()
-
-    if new_hash!=original_hash:
-        raise HTTPException(400,"Tamper detected")
-
-    path=os.path.join(BASE_UPLOAD_FOLDER,"decrypted_file")
-
-    with open(path,"wb") as f:
-        f.write(decrypted)
-
-    # Decryption Notification
-    connection=get_connection()
-    cursor=connection.cursor(dictionary=True)
-
-    cursor.execute("SELECT id FROM users WHERE email=%s",(email,))
-    user=cursor.fetchone()
-
-    if user:
-        add_notification(user["id"], "File decrypted successfully")
-
-    cursor.close()
-    connection.close()
-
-    return FileResponse(path,filename="decrypted_file")
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        print(f"Decryption error: {str(e)}")
+        raise HTTPException(500, f"Decryption failed: {str(e)}")
 
 # ==========================================================
 # USER HISTORY
@@ -474,3 +636,59 @@ def get_notifications(email:str):
     connection.close()
 
     return {"notifications":notifications}
+
+# ==========================================================
+# FORGOT PASSWORD
+# ==========================================================
+@app.post("/forgot-password")
+def forgot_password(data:ForgotPassword):
+    connection=get_connection()
+    cursor=connection.cursor(dictionary=True)
+
+    cursor.execute("SELECT id FROM users WHERE email=%s",(data.email,))
+    user=cursor.fetchone()
+
+    if not user:
+        cursor.close()
+        connection.close()
+        raise HTTPException(404,"Email id not registered")
+
+    otp=str(random.randint(100000,999999))
+    cursor.execute("UPDATE users SET otp=%s WHERE email=%s",(otp,data.email))
+    connection.commit()
+
+    cursor.close()
+    connection.close()
+
+    send_otp_email(data.email,otp)
+
+    return {"message":"OTP sent to your email"}
+
+# ==========================================================
+# RESET PASSWORD
+# ==========================================================
+@app.post("/reset-password")
+def reset_password(data:ResetPassword):
+    if data.new_password != data.confirm_password:
+        raise HTTPException(400,"Passwords do not match")
+
+    connection=get_connection()
+    cursor=connection.cursor(dictionary=True)
+
+    cursor.execute("SELECT id FROM users WHERE email=%s",(data.email,))
+    user=cursor.fetchone()
+
+    if not user:
+        cursor.close()
+        connection.close()
+        raise HTTPException(404,"User not found")
+
+    cursor.execute("UPDATE users SET password=%s WHERE email=%s",(data.new_password,data.email))
+    connection.commit()
+
+    add_notification(user["id"], "Your password has been reset successfully. You can now login with your new password.")
+
+    cursor.close()
+    connection.close()
+
+    return {"message":"Password updated successfully"}
